@@ -342,35 +342,60 @@ This means:
 3. **Physical address targeting** — unlike virtual R/W, we can read coprocessor shared memory, MMIO regions, or IOMMU tables if we know their physical addresses
 4. **Cross-run persistence** — the dangling PTEs survive across exploit runs (confirmed: 0xBB pattern persisted across two separate runs on 15 Pro)
 
-### What We Can Do With It (Concrete Exploitation Path)
+### pmap_tte_remove as a Standalone Jailbreak (No Chain Required)
 
-Given THEIA's full chain (WebContent → sandbox escape → code exec → pmap_tte_remove), the concrete post-exploitation sequence is:
+**pmap_tte_remove does not need the THEIA WebKit chain.** It works from a local app. A single sideloaded IPA — via Sideloadly, AltStore, TrollStore, or any signing service — runs the overflow, gets 64 dangling PTEs, and has direct physical memory access to the kernel. The app already has code execution (it's a running process), so there is no need for a browser exploit, a sandbox escape CVE, or dyld interposition. The only thing the app needs is to escalate from userspace to kernel, and pmap does that deterministically.
 
-**Step 1: Stable kernel R/W (immediate)**
-The 64 dangling PTEs give direct physical memory access. Spray `kalloc` objects into the freed pages (IOSurface property spray is ideal — controlled size, controlled content, no entitlements). Read back through dangling mappings to identify which kernel objects landed. This gives stable, bidirectional kernel R/W with no further exploitation needed.
+This makes pmap_tte_remove a **direct Cyanide competitor** as a standalone jailbreak. Cyanide packages DarkSword's socket race into an IPA. We can do the same with pmap — except ours is deterministic (64/64 vs race-dependent), operates below PPL/SPTM, and is unpatched through iOS 26.6b1 while DarkSword died in 26.1.
 
-**Step 2: Root (minutes)**
-Walk `allproc` (kernel's process list) to find our `proc` structure. Read `proc->p_ucred`, overwrite `cr_uid = 0`, `cr_gid = 0`, `cr_groups[0] = 0`. Process is now root. This is what Cyanide does, but Cyanide goes through `getsockopt`/`setsockopt` — we write directly to physical memory.
+**Concrete: what a pmap IPA does, step by step:**
 
-**Step 3: Sandbox escape (minutes)**
-Two options, both proven in the wild:
-- **Extension data patch** (DarkSword/Cyanide method): find the process's sandbox profile in kernel memory, patch the extension data to remove all restrictions
-- **sandbox_label nullification**: zero out the `sandbox_label` pointer in our `proc->p_ucred->cr_label`. The sandbox evaluator treats a null label as "no sandbox." Simpler, fewer bytes to write.
+**Step 1: Trigger the overflow (seconds)**
+The IPA calls `mmap(MAP_SHARED)` 65,537 times on the same file-backed page. The `pt_desc` refcount wraps from 65535 → 0. `pmap_tte_remove` sees zero, frees the page table page via `pmap_free_pt_delayed`. 64 PTEs now dangle — they still map physical pages the kernel thinks are free. No race, no timing, no heap feng shui. Deterministic on A13, A17 Pro, and A19.
 
-**Step 4: Trust cache injection (hours of engineering)**
-Read the kernel's `trust_cache_runtime` structure, find the linked list of loaded trust caches. Allocate a new trust cache entry (via the physical R/W — write the CDHash of our unsigned binary into a `kalloc` allocation, link it into the chain). AMFI now treats our code as Apple-signed. This enables loading a package manager (Sileo/Zebra), a tweak injector (Substitute/Ellekit), and arbitrary daemons.
+**Step 2: Kernel R/W (seconds)**
+Spray `kalloc` objects into the freed physical pages. IOSurface property spray is ideal: controlled size, controlled content, no entitlements needed, callable from any app sandbox. Read back through the dangling userspace mappings to identify which kernel objects landed. The app now has stable, bidirectional kernel read/write — directly through physical memory, not through syscalls. No kernel code runs during these accesses.
 
-**Step 5: Kernel task port (optional, for persistence)**
-Construct a fake `ipc_port` in a controlled `kalloc` allocation, set its `ip_kobject` to the kernel task. Insert a send right into our IPC space. Now we have `task_for_pid(0)` — `mach_vm_read`/`mach_vm_write` on all kernel memory through the Mach API. This survives even if the dangling PTEs are reclaimed, as long as the port right is held.
+**Step 3: Root (seconds)**
+Walk `allproc` to find the app's `proc` structure. Read `proc->p_ucred`. Overwrite `cr_uid = 0`, `cr_gid = 0`, `cr_groups[0] = 0`. The process is now root. Same thing Cyanide does, except Cyanide reads/writes through `getsockopt`/`setsockopt` (virtual memory, kernel code path) — we write directly to physical memory with no kernel involvement.
+
+**Step 4: Sandbox escape (seconds)**
+Two proven approaches:
+- **Extension data patch** (what Cyanide uses): find the process's sandbox profile in kernel memory, overwrite the extension data bitfield to remove all restrictions
+- **Label nullification** (simpler): zero out the `sandbox_label` pointer in `proc->p_ucred->cr_label`. The sandbox evaluator treats a null label as "no sandbox." Fewer bytes to write, same result.
+
+The app is now root and unsandboxed. It can read/write any file on the filesystem, signal any process, and access any Mach port.
+
+**Step 5: Trust cache injection (minutes of runtime, hours of engineering)**
+Read the kernel's `trust_cache_runtime` linked list. Write a new trust cache entry containing the CDHash of unsigned binaries into a `kalloc` allocation. Link it into the chain. AMFI now accepts our code as if it were Apple-signed. This enables:
+- Package managers (Sileo, Zebra)
+- Tweak injectors (Substitute, Ellekit)
+- Arbitrary daemons and CLI tools
+- **iCleaner, Filza, or any jailbreak app from any repo**
 
 **Step 6: Full jailbreak (the end state)**
-With root + sandbox escape + trust cache + kernel task port:
-- Mount `/` as read-write
+With root + sandbox escape + trust cache:
+- Remount `/` read-write
 - Install a bootstrap (package manager + core utilities)
-- Inject a tweak loader into SpringBoard and all processes (what Cyanide does at the end)
-- Optionally patch AMFI/sandbox kernel functions for permanent bypass until reboot
+- Inject a tweak loader into SpringBoard and all processes
+- Add repos, install tweaks, run iCleaner, Filza, whatever
+- Optionally construct a kernel task port for persistent `mach_vm_read`/`mach_vm_write` access
+- Optionally patch AMFI/sandbox policy functions in kernel memory for permanent bypass until reboot
 
-The entire sequence from "user visits a web page" to "fully jailbroken device" is theoretically achievable through the THEIA chain. The first three CVEs get us to code execution. pmap_tte_remove gets us to kernel. Steps 2–6 are post-exploitation engineering — no new vulnerabilities required.
+**One IPA. One tap. Jailbroken.** No web page, no Safari, no multi-stage chain. The user sideloads the app, presses a button, and the device is jailbroken. That's the value of pmap_tte_remove as a standalone primitive — it's the entire kernel escalation in a single, deterministic, unpatched bug.
+
+### As Part of THEIA (Remote Chain)
+
+The THEIA chain adds a *remote* attack vector on top of the standalone capability:
+
+```
+CVE-2025-43529 (WebKit JIT type confusion)
+  → CVE-2025-14174 (WebContent sandbox escape via IPC)
+    → CVE-2026-20700 (dyld interpose → code execution in WebContent)
+      → pmap_tte_remove (kernel R/W → full jailbreak)
+```
+
+With THEIA, the user visits a web page and the device is jailbroken — no sideloading, no computer, no signing service. The first three CVEs handle getting code execution from a browser tab. pmap_tte_remove handles everything from kernel escalation onward. Steps 1–6 above run identically whether triggered from a local IPA or from WebKit — the pmap primitive doesn't care how it got code execution.
 
 ---
 
