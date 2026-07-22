@@ -298,6 +298,82 @@ Write-through to reallocated kernel pages enables patching kernel text (if pages
 
 ---
 
+## Comparison with DarkSword/Cyanide (zeroxjf)
+
+zeroxjf's [Cyanide](https://github.com/zeroxjf/cyanide) is the closest public analog — an iOS tweak runner built on opa334's [DarkSword](https://github.com/AntonioCiolino/DarkSword-Analysis) kernel R/W primitive. Both achieve the same end state (kernel read/write → sandbox escape → process control), but through fundamentally different bug classes and with different implications for Apple's mitigation stack.
+
+### How DarkSword Gets Kernel R/W
+
+DarkSword exploits **CVE-2025-43510 / CVE-2025-43520** — an ICMPv6 socket race condition in XNU's networking stack. Two threads race on socket lifecycle operations, producing a use-after-free on a kernel socket structure. The freed socket is replaced with a controlled allocation (heap feng shui), giving the attacker a confused `struct socket *` with attacker-controlled fields. From there, socket option read/write syscalls (`getsockopt`/`setsockopt`) become arbitrary kernel read/write.
+
+**Post-exploitation (what Cyanide does with kernel R/W):**
+- **Sandbox escape** via extension data patching — overwrites the process's sandbox profile in kernel memory to remove restrictions
+- **Filesystem access** via namecache + `vm_map` patching — modifies the virtual memory map and name cache to access files outside the sandbox container
+- **Root** — overwrites `cr_uid`/`cr_gid` to 0 in the process `ucred`
+- **ASLR disable** — sets `P_DISABLE_ASLR` in `launchd->proc->p_flag`
+- **Process control** — signal, crash, or modify other userspace processes
+
+**Patched in iOS 26.1.** Cyanide works on iOS 26.0–26.0.1 (A18), dead on 26.1+.
+
+### How pmap_tte_remove Gets Kernel R/W
+
+pmap_tte_remove exploits a **physical use-after-free** in XNU's pmap (physical map) layer. The `pt_desc` refcount is a `uint16_t` — 65,537 `MAP_SHARED` mappings of the same page wrap it to zero. `pmap_tte_remove` sees refcount zero, calls `pmap_free_pt_delayed` to return the physical page to the free list. But 65,536 PTEs still point to it. When the kernel reallocates that physical page for kernel objects, the attacker reads and writes those objects directly through the dangling userspace mappings.
+
+No race condition. No heap spray for the initial primitive. Deterministic: 64/64 write-through on every test across three chip generations.
+
+### Why pmap_tte_remove Is a Stronger Primitive
+
+| | DarkSword (socket race) | pmap_tte_remove (refcount overflow) |
+|---|---|---|
+| **Bug class** | UAF via race condition | Physical UAF via integer overflow |
+| **Reliability** | Probabilistic (race timing) | Deterministic (64/64) |
+| **Mitigation layer** | Operates at socket layer — above PPL/SPTM | Operates at pmap layer — below PPL/SPTM |
+| **PPL/SPTM visibility** | Socket UAF is a normal kernel memory corruption; PPL/SPTM protect page tables from the resulting R/W | Dangling PTEs were installed by pmap itself; PPL/SPTM never re-validate legitimately-installed PTEs |
+| **Patch status** | Fixed in 26.1 | **Unpatched through 26.6b1** — `uint16_t` refcount never widened |
+| **Hardware scope** | Tested A18 | Confirmed A13, A17 Pro, A19 |
+| **Physical memory access** | Indirect (read/write kernel virtual memory) | **Direct** (dangling PTEs map physical pages) |
+| **Coprocessor reach** | No (virtual memory only) | Yes (can map arbitrary physical addresses including MMIO, DMA buffers) |
+
+The critical distinction is **where in the stack the primitive lives**. DarkSword corrupts a kernel data structure and uses normal kernel APIs to read/write memory — every access goes through the standard virtual memory path, which PPL/SPTM monitor. pmap_tte_remove produces dangling *physical* mappings that the hardware MMU serves directly. The kernel, PPL, and SPTM all believe those PTEs are gone (the page table page was freed), but the hardware TLB may still cache them, and the physical pages are reallocated to kernel use. Reads and writes through the dangling mappings never enter a kernel code path — they're bare metal memory accesses at the hardware level.
+
+This means:
+1. **No kernel code runs during the R/W** — there's nothing to detect or intercept
+2. **PPL/SPTM are irrelevant** — they protect page table *modifications*, not *accesses through existing PTEs*
+3. **Physical address targeting** — unlike virtual R/W, we can read coprocessor shared memory, MMIO regions, or IOMMU tables if we know their physical addresses
+4. **Cross-run persistence** — the dangling PTEs survive across exploit runs (confirmed: 0xBB pattern persisted across two separate runs on 15 Pro)
+
+### What We Can Do With It (Concrete Exploitation Path)
+
+Given THEIA's full chain (WebContent → sandbox escape → code exec → pmap_tte_remove), the concrete post-exploitation sequence is:
+
+**Step 1: Stable kernel R/W (immediate)**
+The 64 dangling PTEs give direct physical memory access. Spray `kalloc` objects into the freed pages (IOSurface property spray is ideal — controlled size, controlled content, no entitlements). Read back through dangling mappings to identify which kernel objects landed. This gives stable, bidirectional kernel R/W with no further exploitation needed.
+
+**Step 2: Root (minutes)**
+Walk `allproc` (kernel's process list) to find our `proc` structure. Read `proc->p_ucred`, overwrite `cr_uid = 0`, `cr_gid = 0`, `cr_groups[0] = 0`. Process is now root. This is what Cyanide does, but Cyanide goes through `getsockopt`/`setsockopt` — we write directly to physical memory.
+
+**Step 3: Sandbox escape (minutes)**
+Two options, both proven in the wild:
+- **Extension data patch** (DarkSword/Cyanide method): find the process's sandbox profile in kernel memory, patch the extension data to remove all restrictions
+- **sandbox_label nullification**: zero out the `sandbox_label` pointer in our `proc->p_ucred->cr_label`. The sandbox evaluator treats a null label as "no sandbox." Simpler, fewer bytes to write.
+
+**Step 4: Trust cache injection (hours of engineering)**
+Read the kernel's `trust_cache_runtime` structure, find the linked list of loaded trust caches. Allocate a new trust cache entry (via the physical R/W — write the CDHash of our unsigned binary into a `kalloc` allocation, link it into the chain). AMFI now treats our code as Apple-signed. This enables loading a package manager (Sileo/Zebra), a tweak injector (Substitute/Ellekit), and arbitrary daemons.
+
+**Step 5: Kernel task port (optional, for persistence)**
+Construct a fake `ipc_port` in a controlled `kalloc` allocation, set its `ip_kobject` to the kernel task. Insert a send right into our IPC space. Now we have `task_for_pid(0)` — `mach_vm_read`/`mach_vm_write` on all kernel memory through the Mach API. This survives even if the dangling PTEs are reclaimed, as long as the port right is held.
+
+**Step 6: Full jailbreak (the end state)**
+With root + sandbox escape + trust cache + kernel task port:
+- Mount `/` as read-write
+- Install a bootstrap (package manager + core utilities)
+- Inject a tweak loader into SpringBoard and all processes (what Cyanide does at the end)
+- Optionally patch AMFI/sandbox kernel functions for permanent bypass until reboot
+
+The entire sequence from "user visits a web page" to "fully jailbroken device" is theoretically achievable through the THEIA chain. The first three CVEs get us to code execution. pmap_tte_remove gets us to kernel. Steps 2–6 are post-exploitation engineering — no new vulnerabilities required.
+
+---
+
 ## License
 
 PolyForm Noncommercial 1.0.0. See [LICENSE](LICENSE).
