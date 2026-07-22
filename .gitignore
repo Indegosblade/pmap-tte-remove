@@ -1,0 +1,17 @@
+# OS
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Build artifacts
+*.o
+*.bin
+*.ipa
+*.dSYM/
+
+# Evidence originals (never commit raw panic logs or device dumps)
+evidence/raw/
+
+# IDE
+.vscode/
+.idea/
