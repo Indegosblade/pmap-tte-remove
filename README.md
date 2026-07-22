@@ -255,6 +255,49 @@ data/                                   Raw kernelcache analysis output
 
 ---
 
+## Role in THEIA
+
+This primitive is the **final stage** of the THEIA jailbreak chain:
+
+```
+CVE-2025-43529 (WebKit JIT type confusion)
+  → CVE-2025-14174 (WebContent sandbox escape via IPC)
+    → CVE-2026-20700 (dyld interpose → arbitrary code execution in WebContent)
+      → pmap_tte_remove (Physical UAF → kernel read/write)
+```
+
+THEIA is a full-chain WebContent-to-kernel jailbreak for iOS 26. The first three stages achieve unsandboxed code execution in the WebContent process. This primitive — the pmap_tte_remove refcount overflow — converts that into kernel memory read/write, completing the chain. Apple closed the submission as "expected behavior" but never widened the `uint16_t` refcount, so the primitive remains live across all tested hardware (A13, A17 Pro, A19) through iOS 26.6b1.
+
+## Theoretical Applications
+
+Once 64 dangling PTEs exist (post-overflow, post-free), the attacker controls physical page mappings that the kernel believes are reclaimed. This is a powerful primitive with several theoretical applications:
+
+### Kernel Memory Read/Write
+The primary use. Dangling PTEs still map physical pages that `pmap_free_pt_delayed` has returned to the page allocator. When the kernel reallocates those pages for kernel objects (zone allocations, page tables, kalloc buffers), the attacker reads and writes kernel memory directly through userspace virtual addresses. 64/64 write-through confirmed across A13/A17/A19.
+
+### Credential Modification
+With stable kernel R/W, locate the calling process's `ucred` structure (reachable from `proc` → `p_ucred`) and overwrite `cr_uid`, `cr_gid`, and `cr_groups` to 0. This grants root privileges to the attacking process. Combined with `task_for_pid(0)` or direct task port manipulation, this provides full system control.
+
+### Trust Cache Injection
+Apple's AMFI trust cache validates code signatures at page-in time. With kernel write, inject a new trust cache entry (CDHash) for unsigned binaries. This allows loading arbitrary code — dylibs, daemons, tools — without a valid Apple or developer signature. The standard mechanism for enabling a package manager post-jailbreak.
+
+### Kernel Task Port
+Construct a fake `ipc_port` backed by the kernel task's `ipc_space`, or directly read the kernel's `task_port` and insert a send right into the attacker's IPC space. `task_for_pid(0)` equivalent — gives `mach_vm_read`/`mach_vm_write` access to all kernel memory through the Mach API, which persists across the lifetime of the port right.
+
+### Page Table Manipulation
+Since the primitive already involves dangling page table entries, a natural escalation is to target *other* page tables. Spray L3 page table pages into the freed physical pages, then modify their PTEs to map arbitrary physical addresses — including MMIO regions, IOMMU tables, or the secure monitor's memory. This bypasses KTRR/AMCC protections if the physical address is outside the locked range.
+
+### PPL/SPTM Bypass
+Page Protection Layer (A12-A15) and Secure Page Table Monitor (A16+) protect page tables from kernel modification. However, the pmap_tte_remove primitive operates *below* PPL/SPTM — it exploits the pmap layer's own bookkeeping, not the page tables directly. The dangling PTEs were legitimately created by the pmap code itself before the refcount wrapped. PPL/SPTM do not re-validate PTEs that were already installed by trusted pmap operations. This makes the primitive PPL/SPTM-transparent.
+
+### Coprocessor Memory Access
+Modern iPhones share physical memory between the AP and various coprocessors (SEP, ANE, DCP, AOP). With arbitrary physical address mapping via dangling PTEs, theoretically map coprocessor-shared memory regions to read firmware state, DMA buffers, or mailbox queues. Constrained by DART/IOMMU configuration but not fundamentally prevented if the physical ranges are known.
+
+### Persistent Kernel Patching
+Write-through to reallocated kernel pages enables patching kernel text (if pages are remapped RWX or the patch targets data structures that control code flow). Disable SIP checks, neuter sandbox enforcement, patch AMFI policy functions, or modify syscall tables. On A13 (no KTRR for data segments), this is straightforward. On A14+ with PPL, target data-driven control flow (function pointers, policy tables) rather than code pages.
+
+---
+
 ## License
 
 PolyForm Noncommercial 1.0.0. See [LICENSE](LICENSE).
