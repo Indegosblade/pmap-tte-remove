@@ -6,8 +6,10 @@ Desktop.ini
 # Build artifacts
 *.o
 *.bin
-*.ipa
 *.dSYM/
+
+# Kernelcache binaries (too large for git — provide locally for scripts)
+kernelcaches/
 
 # Evidence originals (never commit raw panic logs or device dumps)
 evidence/raw/

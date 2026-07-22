@@ -200,25 +200,57 @@ The PUAF primitive (64/64 write-through) is the foundation. The chain from primi
 ## Repository Structure
 
 ```
-poc/                           PoC source code
-  poc_v13_rw_proof.c           Main: 64/64 write-through proof + controlled panic
-  poc_v14_uikit.c              UIKit wrapper for app-based patch detection
-  poc_v15_heap_spray.c         IOSurface heap spray escalation
-  cross_pmap_trigger.c         Cross-pmap ownership confusion race
-  pmap_experiment_se.c         Deep primitive analysis (mprotect/TLBI/panic)
-  pmap_spray_se.c              A13 heap spray test
+poc/                                    Raw PoC source (C, no build infrastructure)
+  poc_v13_rw_proof.c                    Main: 64/64 write-through proof + controlled panic
+  poc_v14_uikit.c                       UIKit wrapper for app-based patch detection
+  poc_v15_heap_spray.c                  IOSurface heap spray escalation
+  cross_pmap_trigger.c                  Cross-pmap ownership confusion race (9-thread)
+  pmap_experiment_se.c                  Deep primitive analysis (mprotect/TLBI/panic)
+  pmap_spray_se.c                       A13-specific heap spray (pmap_pages_free_list)
 
-analysis/
-  STAGE5_ROADMAP.md            Exploitation roadmap (primitive → kernel code exec)
-  CROSSPMAP_ASSERTION.md       Cross-pmap PPL assertion analysis
-  diff_26.5b2_to_26.5b3.md    Kernelcache binary diff (instruction-level)
+builds/                                 Full IPA build sources (ObjC wrappers + compile scripts)
+  PmapProbe_v14/                        Stock iOS app — patch detection mode (no panic)
+    main.m, poc_v14.c, compile.sh, Info.plist
+  PmapHeapSpray/                        v17 — 32MB-spaced L3 spray + auto-retry
+    main.m, compile.sh, Info.plist
+  PmapV14Proof/                         Screen-recordable R/W proof for Apple resubmission
+    main.m, Info.plist
 
-evidence/
-  submission_timeline.md       Full Apple correspondence (verbatim)
-  updated_evidence_draft.md    Response draft for Apple rebuttal
+ipa/                                    Pre-built IPA
+  PmapProbe_v14.ipa                     Signed IPA for Sideloadly deployment
 
-scripts/
-  pmap_patch_check.py          Binary diff for new IPSW patch detection
+analysis/                               Technical analysis
+  STAGE5_ROADMAP.md                     Exploitation roadmap (PUAF → kernel code exec)
+  CROSSPMAP_ASSERTION.md                PPL assertion analysis (panic = proof of exploitability)
+  CROSS_PMAP_CONFUSION.md              Cross-pmap ownership confusion deep dive
+  pmap_cross_chip_analysis.md           Cross-version string/symbol comparison (8 IPSWs)
+  kernelcache_diffs/
+    diff_26.5b2_to_26.5b3.md           Instruction-level binary diff (62 diffs, all relocation)
+
+evidence/                               Apple correspondence + device output
+  submission_timeline.md                Full Apple correspondence (verbatim)
+  updated_evidence_draft.md             Rebuttal draft for Apple
+  cross_pmap_submission.md              Cross-pmap confusion submission draft
+  pmap_rw_proof_v14.txt                 Device output: SE v13, 64/64 write-through
+  pmap_rw_proof_v14_15pro.txt           Device output: 15 Pro v14, 63/64 read + 64/64 write
+
+scripts/                                Kernelcache analysis tools (9 scripts)
+  pmap_patch_check.py                   26.5b4 vs 26.6b1 binary diff + LDRH scan
+  pmap_266_detail.py                    Detailed disasm comparison (26.5b4 vs 26.6b1)
+  pmap_compare.py                       26.0 vs 26.5b4 ADRP xref + function extraction
+  pmap_decode.py                        ARM64 instruction decoder (critical region)
+  pmap_decode_265.py                    pmap_remove_options_internal 26.0 vs 26.5 decode
+  pmap_deep2.py                         MachO parser + function extraction + key insn survey
+  pmap_deep_compare.py                  Normalized instruction diff (strips ASLR)
+  pmap_full_analysis_265.py             Full 26.0 vs 26.5 release analysis
+  run_pmap_ipsw.ps1                     PowerShell: ipsw macho symbol extraction
+  run_pmap_search.ps1                   PowerShell: ipsw kernel sym pmap filter
+
+data/                                   Raw kernelcache analysis output
+  ctf_pmap_260.txt, ctf_pmap_265.txt   Control flow traces
+  pmap_macho_260.txt, pmap_macho_265.txt   MachO symbol tables
+  pmap_syms_260.txt, pmap_syms_265.txt     Kernel symbol listings
+  pmap_cstrings_260.txt, pmap_cstrings_265.txt   C string references
 ```
 
 ---

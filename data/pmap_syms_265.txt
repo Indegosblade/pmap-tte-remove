@@ -1,0 +1,8 @@
+﻿0xfffffe000b4653d8 RTBuddyCoredumpMap::gMetaClass
+0xfffffe0008267480 vtable for RTBuddyCoredumpMapEntry::MetaClass
+0xfffffe000a3b5578 RTBuddyCoredumpMap::RTBuddyCoredumpMap
+0xfffffe000b465400 RTBuddyCoredumpMapEntry::gMetaClass
+0xfffffe00082672c8 vtable for RTBuddyCoredumpMap
+0xfffffe000a3b55b0 RTBuddyCoredumpMapEntry::RTBuddyCoredumpMapEntry
+0xfffffe00082673f0 vtable for RTBuddyCoredumpMapEntry
+0xfffffe0008267358 vtable for RTBuddyCoredumpMap::MetaClass

@@ -1,0 +1,16 @@
+pmap_tte_remove UAF — Write-Through Proof (v13)
+Ticket:  OE1105320204625
+Time:    Sun Apr  5 10:17:31 2026
+pid:     9364
+
+OVERFLOW: 65537 mach_vm_map calls — uint16 refcount wrapped to 1
+FREED:    first unmap dropped refcount to 0 (pmap_free_pt_delayed)
+DANGLING: 64 PTEs remain after L3 page table freed
+
+Write-through results (64 attempts):
+  Confirmed:   64
+  Unconfirmed: 0
+
+RESULT: kernel write via dangling PTE CONFIRMED
+        Freed physical page is writable from userspace.
+        NOT local DoS — use-after-free with R/W primitives.
