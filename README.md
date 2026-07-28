@@ -14,13 +14,13 @@ A `uint16_t` refcount field in XNU's `pt_desc` (page table descriptor) structure
 
 Those 64 PTEs provide direct userspace read/write into freed physical memory. When the kernel reallocates that page for a new kernel object, every dangling PTE becomes an arbitrary kernel R/W primitive.
 
-**This is a Physical UAF.** The freed entity is a physical page frame, not a heap zone object. The primitive bypasses:
+**This is a Physical UAF.** The freed entity is a physical page frame, not a heap zone object. The dangling PTE primitive bypasses:
 - Zone integrity checks (operates below zone allocator)
-- SPTM quarantine (confirmed on A17 Pro — dangling PTEs remain architecturally valid through quarantine)
+- SPTM quarantine at the primitive level (confirmed on A17 Pro — dangling PTEs remain architecturally valid and R/W-capable through quarantine, though quarantine prevents the freed page from being reallocated to exploitable kernel objects — see [Limitations](#limitations))
 - MIE / Memory Integrity Extensions (confirmed on A19 — MIE has no visibility into pt_desc refcount accounting)
 - All 32 `tbnz` overflow checks Apple added in iOS 26.0–26.4 (those protect `pmap+0x74`, not `pt_desc`)
 
-**Result: 64/64 write-through confirmed on A13, A17 Pro, and A19.**
+**Result: 64/64 write-through confirmed on A13, A17 Pro, and A19.** The PUAF primitive is confirmed across all tested hardware. Exploitation beyond the primitive (controlled reclaim of freed pages into kernel objects) is blocked by SPTM quarantine on A14+ — see [Limitations](#limitations).
 
 ---
 
@@ -170,16 +170,14 @@ The PUAF primitive (64/64 write-through) is the foundation. The chain from primi
 | Physical page free | **CONFIRMED** | pmap_free_pt_delayed fires, page enters VM free list |
 | Dangling PTE R/W | **CONFIRMED** | 64/64 write-through, 101.1ms create time |
 | A19/MIE bypass | **CONFIRMED** | MIE has no visibility into pt_desc accounting |
-| Controlled reclaim | IN PROGRESS | Heap spray to target specific zone (ipc_port, IOSurface) |
+| Controlled reclaim | **BLOCKED (A14+)** | SPTM quarantine prevents freed L3 pages from re-entering zone allocator. IOSurface heap spray tested on A19 — PTE[0] SIGSEGV. A13 (no SPTM) theoretically viable. |
 | Field overwrite | NOT STARTED | Overwrite kobject/vtable in reclaimed kernel object |
 | Kernel code exec | NOT STARTED | PAC-signed gadget chain from corrupted kernel object |
 
-**Target objects for reclaim (ranked):**
+**Target objects for reclaim (ranked, A13 only — SPTM blocks on A14+):**
 1. `ipc_port` (168 bytes, zone `ipc_ports`) — overwrite `ip_kobject` or `ip_pdestruct` → function pointer → kernel code exec
 2. `vm_map_entry` (192 bytes, zone `vm_map_entries`) — flip protection bits on kernel text → RWX → shellcode
 3. IOKit `OSObject` (variable) — vtable pointer overwrite → IOKit upcall → PAC gadget needed
-
-**Chain position in THEIA:** CVE-2025-43529 → CVE-2025-14174 → CVE-2026-20700 → **pmap_tte_remove** (final primitive, kernel R/W)
 
 ---
 
@@ -188,7 +186,7 @@ The PUAF primitive (64/64 write-through) is the foundation. The chain from primi
 | Mitigation | Blocks Primitive? | Why |
 |------------|------------------|-----|
 | PPL (Page Protection Layer) | NO | PPL validates the operation as structurally sound. The confusion is at pt_desc ownership level, below PPL's audit scope. |
-| SPTM (A17+) | NO | SPTM quarantines freed pages, but dangling PTEs remain architecturally valid through quarantine. 64/64 write-through confirmed on A17 Pro. |
+| SPTM (A14+) | **Primitive: NO. Exploitation: YES.** | Dangling PTEs remain architecturally valid and R/W-capable through quarantine (64/64 write-through on A17 Pro). But SPTM quarantines the freed L3 page, preventing it from being reallocated to exploitable kernel objects. IOSurface heap spray on A19: PTE[0] SIGSEGV. The primitive works; exploitation beyond the primitive is blocked. |
 | MIE (A19) | NO | MIE has no visibility into pt_desc refcount accounting. It sees valid TTE entries. 64/64 confirmed on A19. |
 | PAC (A17/A19) | Partially | Constrains execution phase — full chain on A17+ requires PAC bypass or ROP. Does not block the PUAF primitive. |
 | zone_require | Partially | Constrains reclaim target selection to same-zone objects. Does not prevent the PUAF. |
@@ -220,7 +218,6 @@ ipa/                                    Pre-built IPA
   PmapProbe_v14.ipa                     Signed IPA for Sideloadly deployment
 
 analysis/                               Technical analysis
-  STAGE5_ROADMAP.md                     Exploitation roadmap (PUAF → kernel code exec)
   CROSSPMAP_ASSERTION.md                PPL assertion analysis (panic = proof of exploitability)
   CROSS_PMAP_CONFUSION.md              Cross-pmap ownership confusion deep dive
   pmap_cross_chip_analysis.md           Cross-version string/symbol comparison (8 IPSWs)
@@ -255,22 +252,9 @@ data/                                   Raw kernelcache analysis output
 
 ---
 
-## Role in THEIA
-
-This primitive is the **final stage** of the THEIA jailbreak chain:
-
-```
-CVE-2025-43529 (WebKit JIT type confusion)
-  → CVE-2025-14174 (WebContent sandbox escape via IPC)
-    → CVE-2026-20700 (dyld interpose → arbitrary code execution in WebContent)
-      → pmap_tte_remove (Physical UAF → kernel read/write)
-```
-
-THEIA is a full-chain WebContent-to-kernel jailbreak for iOS 26. The first three stages achieve unsandboxed code execution in the WebContent process. This primitive — the pmap_tte_remove refcount overflow — converts that into kernel memory read/write, completing the chain. Apple closed the submission as "expected behavior" but never widened the `uint16_t` refcount, so the primitive remains live across all tested hardware (A13, A17 Pro, A19) through iOS 26.6b1.
-
 ## Theoretical Applications
 
-Once 64 dangling PTEs exist (post-overflow, post-free), the attacker controls physical page mappings that the kernel believes are reclaimed. This is a powerful primitive with several theoretical applications:
+Once 64 dangling PTEs exist (post-overflow, post-free), the attacker controls physical page mappings that the kernel believes are reclaimed. On A13 and earlier (no SPTM), the freed page re-enters the general page allocator and can be reclaimed by kernel objects. On A14+ (SPTM), the freed L3 page is quarantined and will not be reallocated — the theoretical applications below require controlled reclaim and are therefore **A13-only** unless an SPTM quarantine bypass is found.
 
 ### Kernel Memory Read/Write
 The primary use. Dangling PTEs still map physical pages that `pmap_free_pt_delayed` has returned to the page allocator. When the kernel reallocates those pages for kernel objects (zone allocations, page tables, kalloc buffers), the attacker reads and writes kernel memory directly through userspace virtual addresses. 64/64 write-through confirmed across A13/A17/A19.
@@ -287,8 +271,8 @@ Construct a fake `ipc_port` backed by the kernel task's `ipc_space`, or directly
 ### Page Table Manipulation
 Since the primitive already involves dangling page table entries, a natural escalation is to target *other* page tables. Spray L3 page table pages into the freed physical pages, then modify their PTEs to map arbitrary physical addresses — including MMIO regions, IOMMU tables, or the secure monitor's memory. This bypasses KTRR/AMCC protections if the physical address is outside the locked range.
 
-### PPL/SPTM Bypass
-Page Protection Layer (A12-A15) and Secure Page Table Monitor (A16+) protect page tables from kernel modification. However, the pmap_tte_remove primitive operates *below* PPL/SPTM — it exploits the pmap layer's own bookkeeping, not the page tables directly. The dangling PTEs were legitimately created by the pmap code itself before the refcount wrapped. PPL/SPTM do not re-validate PTEs that were already installed by trusted pmap operations. This makes the primitive PPL/SPTM-transparent.
+### PPL/SPTM Bypass (Primitive Level Only)
+Page Protection Layer (A12-A15) and Secure Page Table Monitor (A16+) protect page tables from kernel modification. The pmap_tte_remove primitive operates *below* PPL/SPTM — it exploits the pmap layer's own bookkeeping, not the page tables directly. The dangling PTEs were legitimately created by the pmap code itself before the refcount wrapped. PPL/SPTM do not re-validate PTEs that were already installed by trusted pmap operations. This makes the **primitive** PPL/SPTM-transparent — the dangling PTEs remain R/W-capable. However, SPTM quarantine on A14+ prevents the freed page from being reallocated to useful kernel objects, blocking the exploitation path beyond the primitive itself.
 
 ### Coprocessor Memory Access
 Modern iPhones share physical memory between the AP and various coprocessors (SEP, ANE, DCP, AOP). With arbitrary physical address mapping via dangling PTEs, theoretically map coprocessor-shared memory regions to read firmware state, DMA buffers, or mailbox queues. Constrained by DART/IOMMU configuration but not fundamentally prevented if the physical ranges are known.
@@ -342,11 +326,11 @@ This means:
 3. **Physical address targeting** — unlike virtual R/W, we can read coprocessor shared memory, MMIO regions, or IOMMU tables if we know their physical addresses
 4. **Cross-run persistence** — the dangling PTEs survive across exploit runs (confirmed: 0xBB pattern persisted across two separate runs on 15 Pro)
 
-### pmap_tte_remove as a Standalone Jailbreak (No Chain Required)
+### pmap_tte_remove as a Standalone Kernel Primitive (No Chain Required)
 
-**pmap_tte_remove does not need the THEIA WebKit chain.** It works from a local app. A single sideloaded IPA — via Sideloadly, AltStore, TrollStore, or any signing service — runs the overflow, gets 64 dangling PTEs, and has direct physical memory access to the kernel. The app already has code execution (it's a running process), so there is no need for a browser exploit, a sandbox escape CVE, or dyld interposition. The only thing the app needs is to escalate from userspace to kernel, and pmap does that deterministically.
+**pmap_tte_remove does not need a browser exploit chain.** It works from a local app. A single sideloaded IPA — via Sideloadly, AltStore, TrollStore, or any signing service — runs the overflow, gets 64 dangling PTEs, and has direct physical memory access to the kernel. The app already has code execution (it's a running process), so there is no need for a browser exploit, a sandbox escape CVE, or dyld interposition. The only thing the app needs is to escalate from userspace to kernel, and pmap does that deterministically.
 
-This makes pmap_tte_remove a **direct Cyanide competitor** as a standalone jailbreak. Cyanide packages DarkSword's socket race into an IPA. We can do the same with pmap — except ours is deterministic (64/64 vs race-dependent), operates below PPL/SPTM, and is unpatched through iOS 26.6b1 while DarkSword died in 26.1.
+This makes pmap_tte_remove comparable to DarkSword/Cyanide as a standalone kernel primitive — except ours is deterministic (64/64 vs race-dependent), operates below PPL/SPTM, and is unpatched through iOS 26.6b1 while DarkSword died in 26.1. **However**, the controlled reclaim step (Step 2 below) is blocked by SPTM quarantine on A14+ hardware. On A13 (no SPTM), the full exploitation path is theoretically viable. On A14+, pmap_tte_remove is a confirmed PUAF primitive with demonstrated write-through to freed physical memory, but escalation to full kernel R/W requires an SPTM quarantine bypass that does not currently exist.
 
 **Concrete: what a pmap IPA does, step by step:**
 
@@ -384,18 +368,25 @@ With root + sandbox escape + trust cache:
 
 **One IPA. One tap. Jailbroken.** No web page, no Safari, no multi-stage chain. The user sideloads the app, presses a button, and the device is jailbroken. That's the value of pmap_tte_remove as a standalone primitive — it's the entire kernel escalation in a single, deterministic, unpatched bug.
 
-### As Part of THEIA (Remote Chain)
+---
 
-The THEIA chain adds a *remote* attack vector on top of the standalone capability:
+## Limitations
 
-```
-CVE-2025-43529 (WebKit JIT type confusion)
-  → CVE-2025-14174 (WebContent sandbox escape via IPC)
-    → CVE-2026-20700 (dyld interpose → code execution in WebContent)
-      → pmap_tte_remove (kernel R/W → full jailbreak)
-```
+### SPTM Quarantine Blocks Exploitation on A14+ (iPhone 12 and Later)
 
-With THEIA, the user visits a web page and the device is jailbroken — no sideloading, no computer, no signing service. The first three CVEs handle getting code execution from a browser tab. pmap_tte_remove handles everything from kernel escalation onward. Steps 1–6 above run identically whether triggered from a local IPA or from WebKit — the pmap primitive doesn't care how it got code execution.
+The PUAF primitive — 64 dangling PTEs with confirmed R/W access to freed physical memory — works on all tested hardware (A13, A17 Pro, A19). However, converting the primitive into a useful kernel R/W exploit requires **controlled reclaim**: the freed physical page must be reallocated to a kernel object (ipc_port, vm_map_entry, etc.) whose fields can be corrupted through the dangling PTEs.
+
+On A14+ hardware, SPTM quarantines freed L3 page table pages. The quarantined page is not returned to the general page allocator — it sits in a quarantine list until SPTM determines it is safe to release. During quarantine, the kernel will not allocate the page for zone objects. IOSurface heap spray testing on the iPhone 17 Pro (A19, iOS 26.0) resulted in PTE[0] SIGSEGV — the freed page was never reclaimed by the spray.
+
+**On A13 and earlier (no SPTM):** The freed page enters `pmap_pages_free_list` and can be reclaimed by any subsequent page allocation. This is the standard PUAF exploitation path — heap spray immediately after the free, race to reclaim, corrupt the reclaimed kernel object. This path was not fully developed before the Apple submission was closed.
+
+**Practical impact:**
+- A14+ (iPhone 12 and later): PUAF confirmed, write-through confirmed, but exploitation is architecturally blocked by SPTM quarantine. The bug is a confirmed kernel correctness issue with demonstrated physical memory corruption — but not a viable kernel R/W primitive on modern hardware without an SPTM quarantine bypass.
+- A13 and earlier (iPhone 11 and earlier): Full exploitation chain is theoretically viable. No SPTM means no quarantine. The freed page is immediately available for reclaim.
+
+### Apple's Position
+
+Apple closed the submission (OE1105320204625) as "expected behavior" and issued a program warning alleging evidence fabrication. They subsequently added overflow detection (SUBS), a pin/unpin mutex, and deferred freeing in iOS 26.4.2 — but never widened the `uint16_t` refcount type. The fundamental integer overflow remains through iOS 26.6b1.
 
 ---
 
