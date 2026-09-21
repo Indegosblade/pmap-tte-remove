@@ -1,7 +1,5 @@
 # pmap_tte_remove: Physical UAF via uint16 pt_desc Refcount Overflow
 
-**Apple Security Bounty Submission**
-**Status:** CLOSED 2026-04-26 ("expected behavior") + PROGRAM WARNING 2026-04-27  
 **Patch Status:** MITIGATED-NOT-FIXED through iOS 26.6b1 (uint16_t refcount never widened)  
 **Affected:** All iOS versions 15.5 through 26.6b1, all chips A13 through A19  
 **Author:** Kevin Estrada  
